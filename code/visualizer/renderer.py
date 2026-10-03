@@ -13,6 +13,10 @@ def show_visualizer_ui():
         st.error("No execution snapshots loaded.")
         if st.button("Back to Workspace"):
             st.session_state.visualizer_active = False
+            st.session_state.visualizer_snapshots = []
+            st.session_state.visualizer_source_lines = []
+            import gc
+            gc.collect()
             st.rerun()
         return
 
@@ -33,6 +37,10 @@ def show_visualizer_ui():
         if st.button("⏹ Stop Visualizer", use_container_width=True):
             st.session_state.visualizer_is_playing = False
             st.session_state.visualizer_active = False
+            st.session_state.visualizer_snapshots = []
+            st.session_state.visualizer_source_lines = []
+            import gc
+            gc.collect()
             st.rerun()
 
     st.markdown("<hr style='margin: 8px 0 12px 0; border-color: #21262d;'>", unsafe_allow_html=True)
@@ -641,6 +649,9 @@ def show_visualizer_ui():
             // Computes step explanation dynamically in JS
             function generateExplanation(step, prevStep) {{
                 if (step.event === 'exception' && step.exception) {{
+                    if (step.exception.type === 'StepLimitReached') {{
+                        return `<span style="color: #f0883e; font-weight: bold;">ℹ️ Trace Limit:</span> ${{escapeHtml(step.exception.message)}}`;
+                    }}
                     return `<span style="color: #f85149; font-weight: bold;">⚠️ Stopped due to error:</span> <code>${{escapeHtml(step.exception.type)}}</code>: ${{escapeHtml(step.exception.message)}}`;
                 }}
 
@@ -868,9 +879,14 @@ def show_visualizer_ui():
                 const errorDiv = document.getElementById("error-container");
                 if (step.exception) {{
                     errorDiv.style.display = "block";
+                    const isLimit = step.exception.type === "StepLimitReached";
+                    const boxBg = isLimit ? "#2b1f13" : "#2d191e";
+                    const boxBorder = isLimit ? "#d29922" : "#f85149";
+                    const textColor = isLimit ? "#e3b341" : "#ff7b72";
+                    const bannerTitle = isLimit ? "ℹ️ TRACE BOUND REACHED" : "⚠️ EXECUTION STOPPED (" + escapeHtml(step.exception.type) + ")";
                     errorDiv.innerHTML = `
-                        <div style="background-color: #2d191e; border: 1px solid #f85149; border-radius: 8px; padding: 12px; color: #ff7b72; font-family: 'JetBrains Mono', monospace; font-size: 13px; margin-bottom: 12px;">
-                            <div style="font-weight: bold; font-size: 14.5px; margin-bottom: 4px;">⚠️ EXECUTION STOPPED (${{escapeHtml(step.exception.type)}})</div>
+                        <div style="background-color: ${{boxBg}}; border: 1px solid ${{boxBorder}}; border-radius: 8px; padding: 12px; color: ${{textColor}}; font-family: 'JetBrains Mono', monospace; font-size: 13px; margin-bottom: 12px;">
+                            <div style="font-weight: bold; font-size: 14.5px; margin-bottom: 4px;">${{bannerTitle}}</div>
                             <div>${{escapeHtml(step.exception.message)}}</div>
                             <div style="margin-top: 6px; font-size: 11px; color: #8b949e;">Line ${{step.line}}: ${{escapeHtml((codeLines[step.line - 1] || '').trim())}}</div>
                         </div>

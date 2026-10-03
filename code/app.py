@@ -196,9 +196,11 @@ is_fast_mode = "Fast" in mode_toggle
 MAX_TOKENS = 150 if is_fast_mode else 500
 TEMPERATURE = 0.0 if is_fast_mode else 0.3 # 0.0 is deterministic and faster
 
-# Cached Model & Tokenizer Loader
-@st.cache_resource(show_spinner=False)
+# Cached Model & Tokenizer Loader (Bounded to 1 active model to prevent OOM)
+@st.cache_resource(max_entries=1, show_spinner=False)
 def get_model_and_tokenizer(model_name: str):
+    import gc
+    gc.collect()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -208,7 +210,8 @@ def get_model_and_tokenizer(model_name: str):
     if device == "cuda":
         torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     else:
-        torch_dtype = torch.float32
+        # Use bfloat16 on CPU if available to cut memory footprint in half for Cloud resource limits
+        torch_dtype = torch.bfloat16
         
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -219,35 +222,43 @@ def get_model_and_tokenizer(model_name: str):
             attn_implementation="sdpa"
         ).to(device)
     except Exception:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True
-        ).to(device)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True
+            ).to(device)
+        except Exception:
+            # Fallback to float32 if CPU doesn't support bfloat16 kernels
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True
+            ).to(device)
         
     model.eval()
     return model, tokenizer, device
 
-# Handle model loading with UI feedback only when a new model loads
+# On-demand lazy model loader to preserve Cloud resources
 model, tokenizer, device = None, None, "cpu"
 static_only_mode = False
 
-try:
-    if "loaded_models" not in st.session_state:
-        st.session_state.loaded_models = set()
-        
-    if MODEL_NAME not in st.session_state.loaded_models:
-        with st.sidebar:
-            with st.spinner(f"Loading {MODEL_NAME.split('/')[-1]}..."):
+def get_ai_backend():
+    """Lazily loads the AI model only when an AI task is actually requested."""
+    global model, tokenizer, device, static_only_mode
+    if model is None and not static_only_mode:
+        try:
+            with st.spinner(f"Loading {MODEL_NAME.split('/')[-1]} on-demand..."):
                 model, tokenizer, device = get_model_and_tokenizer(MODEL_NAME)
-                st.session_state.loaded_models.add(MODEL_NAME)
-    else:
-        model, tokenizer, device = get_model_and_tokenizer(MODEL_NAME)
-except Exception as e:
-    st.sidebar.error(f"Failed to load local model: {str(e)}")
-    st.sidebar.warning("Falling back to Static Analysis Mode. AI features will be disabled.")
-    static_only_mode = True
+        except Exception as e:
+            st.sidebar.error(f"Failed to load AI model: {str(e)}")
+            st.sidebar.warning("Falling back to Static Analysis Mode. AI features will be disabled.")
+            static_only_mode = True
+    return model, tokenizer, device
+
+st.sidebar.caption("⚡ Model loaded on-demand to stay within Cloud memory limits.")
 
 # 4. State Initializations
 if "response_cache" not in st.session_state:
@@ -285,7 +296,16 @@ def get_cache_key(code: str, action: str, mode: str, model_name: str):
     combined = f"{code}_{action}_{mode}_{model_name}"
     return hashlib.sha256(combined.encode('utf-8')).hexdigest()
 
-# 5. Local Code Execution (Safe and Timeout protected)
+def set_response_cache(key: str, val: dict):
+    """Stores response in cache bounded to 10 items to prevent memory bloat."""
+    if "response_cache" not in st.session_state:
+        st.session_state.response_cache = {}
+    if len(st.session_state.response_cache) >= 10:
+        first_key = next(iter(st.session_state.response_cache))
+        del st.session_state.response_cache[first_key]
+    st.session_state.response_cache[key] = val
+
+# 5. Local Code Execution (Safe and Timeout/Step protected)
 def execute_python_code(code: str, user_inputs: str = ""):
     """Executes Python code safely, returns (output, error_message, error_line)"""
     old_stdout = sys.stdout
@@ -309,14 +329,20 @@ def execute_python_code(code: str, user_inputs: str = ""):
     
     start_time = time.time()
     timeout_seconds = 3.0
+    step_count = 0
+    max_steps = 10000
     
     def trace_calls(frame, event, arg):
+        nonlocal step_count
+        step_count += 1
+        if step_count > max_steps:
+            raise RuntimeError(f"Execution exceeded the maximum limit of {max_steps} execution steps.")
         if time.time() - start_time > timeout_seconds:
             raise TimeoutError(f"Execution exceeded the {timeout_seconds} seconds limit.")
         return trace_calls
         
-    sys.settrace(trace_calls)
     try:
+        sys.settrace(trace_calls)
         exec(code, exec_globals)
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
@@ -757,6 +783,12 @@ with col_results:
                     st.session_state.last_result = result_obj
                     render_result(action, result_obj)
                 else:
+                    # Clear old visualizer state before tracing to prevent memory accumulation
+                    st.session_state.visualizer_snapshots = []
+                    st.session_state.visualizer_source_lines = []
+                    import gc
+                    gc.collect()
+
                     with st.spinner("Preparing visualization..."):
                         from visualizer.tracer import ExecutionTracer
                         start_time = time.time()
@@ -781,7 +813,8 @@ with col_results:
                     st.session_state.last_result = result_obj
                     render_result(action, result_obj)
                 else:
-                    if static_only_mode or model is None:
+                    ai_model, ai_tokenizer, ai_device = get_ai_backend()
+                    if static_only_mode or ai_model is None:
                         result_obj = {"type": "error", "message": "AI model loading failed. Cannot generate explanation."}
                         st.session_state.last_result = result_obj
                         render_result(action, result_obj)
@@ -796,7 +829,7 @@ with col_results:
                         
                         response_chunks = []
                         try:
-                            for chunk in generate_response_stream(model, tokenizer, device, prompt_text, MAX_TOKENS, TEMPERATURE):
+                            for chunk in generate_response_stream(ai_model, ai_tokenizer, ai_device, prompt_text, MAX_TOKENS, TEMPERATURE):
                                 status_placeholder.empty()
                                 response_chunks.append(chunk)
                                 placeholder.markdown("".join(response_chunks) + "▌")
@@ -810,7 +843,7 @@ with col_results:
                                 "content": full_response,
                                 "elapsed": elapsed
                             }
-                            st.session_state.response_cache[cache_key] = result_obj
+                            set_response_cache(cache_key, result_obj)
                             st.session_state.last_result = result_obj
                             st.caption(f"⏱️ Generated in {elapsed:.3f} seconds.")
                         except Exception as e:
@@ -836,38 +869,42 @@ with col_results:
                         st.subheader(f"Result: {action}")
                         st.markdown(f"<div class='error-box'><b>Syntax Error:</b> {syntax_error_msg} at line {syntax_line}</div>", unsafe_allow_html=True)
                         
-                        if static_only_mode or model is None:
+                        if static_only_mode:
                             st.warning("Static-only mode: Cannot generate deep error corrections.")
                         else:
-                            prompt_text = get_instruction_for_mode("Fix Errors", len(code_input), is_fast_mode, {"message": syntax_error_msg, "line": syntax_line})
-                            prompt_text += f"\n\nCode causing error:\n```python\n{err_snippet}\n```"
-                            
-                            status_placeholder = st.info("Asking AI for a fast syntax fix...")
-                            placeholder = st.empty()
-                            
-                            response_chunks = []
-                            try:
-                                for chunk in generate_response_stream(model, tokenizer, device, prompt_text, MAX_TOKENS, TEMPERATURE):
-                                    status_placeholder.empty()
-                                    response_chunks.append(chunk)
-                                    placeholder.markdown(f"<div class='fix-box'><b>Suggested Fix:</b><br><br>{''.join(response_chunks)}▌</div>", unsafe_allow_html=True)
+                            ai_model, ai_tokenizer, ai_device = get_ai_backend()
+                            if ai_model is None:
+                                st.warning("AI model could not be loaded. Please check resource availability.")
+                            else:
+                                prompt_text = get_instruction_for_mode("Fix Errors", len(code_input), is_fast_mode, {"message": syntax_error_msg, "line": syntax_line})
+                                prompt_text += f"\n\nCode causing error:\n```python\n{err_snippet}\n```"
                                 
-                                full_explanation = "".join(response_chunks)
-                                placeholder.markdown(f"<div class='fix-box'><b>Suggested Fix:</b><br><br>{full_explanation}</div>", unsafe_allow_html=True)
-                                elapsed = time.time() - start_time
+                                status_placeholder = st.info("Asking AI for a fast syntax fix...")
+                                placeholder = st.empty()
                                 
-                                result_obj = {
-                                    "type": "fix_errors_failed",
-                                    "error_msg": syntax_error_msg,
-                                    "error_line": syntax_line,
-                                    "explanation": full_explanation,
-                                    "elapsed": elapsed
-                                }
-                                st.session_state.response_cache[cache_key] = result_obj
-                                st.session_state.last_result = result_obj
-                                st.caption(f"⏱️ Fix generated in {elapsed:.3f} seconds.")
-                            except Exception as e:
-                                st.error(f"LLM Error: {str(e)}")
+                                response_chunks = []
+                                try:
+                                    for chunk in generate_response_stream(ai_model, ai_tokenizer, ai_device, prompt_text, MAX_TOKENS, TEMPERATURE):
+                                        status_placeholder.empty()
+                                        response_chunks.append(chunk)
+                                        placeholder.markdown(f"<div class='fix-box'><b>Suggested Fix:</b><br><br>{''.join(response_chunks)}▌</div>", unsafe_allow_html=True)
+                                    
+                                    full_explanation = "".join(response_chunks)
+                                    placeholder.markdown(f"<div class='fix-box'><b>Suggested Fix:</b><br><br>{full_explanation}</div>", unsafe_allow_html=True)
+                                    elapsed = time.time() - start_time
+                                    
+                                    result_obj = {
+                                        "type": "fix_errors_failed",
+                                        "error_msg": syntax_error_msg,
+                                        "error_line": syntax_line,
+                                        "explanation": full_explanation,
+                                        "elapsed": elapsed
+                                    }
+                                    set_response_cache(cache_key, result_obj)
+                                    st.session_state.last_result = result_obj
+                                    st.caption(f"⏱️ Fix generated in {elapsed:.3f} seconds.")
+                                except Exception as e:
+                                    st.error(f"LLM Error: {str(e)}")
                     else:
                         # Step 2: Check runtime error
                         output, error_msg, error_line = execute_python_code(code_input, program_input)
@@ -881,12 +918,12 @@ with col_results:
                                 "content": "No syntax or runtime errors detected by local Python environment! 🎉",
                                 "elapsed": elapsed
                             }
-                            st.session_state.response_cache[cache_key] = result_obj
+                            set_response_cache(cache_key, result_obj)
                             st.session_state.last_result = result_obj
                             st.caption(f"⏱️ Local scan completed in {elapsed:.3f} seconds.")
                             
                             # Give option to do deep logical check
-                            if not static_only_mode and model is not None:
+                            if not static_only_mode:
                                 st.markdown("---")
                                 st.markdown("##### 🔍 Deep Logical AI verification")
                                 if st.button("Perform Deep Logic Scan"):
@@ -898,69 +935,77 @@ with col_results:
                             st.subheader(f"Result: {action}")
                             st.markdown(f"<div class='error-box'><b>Runtime Error:</b> {error_msg} at line {error_line}</div>", unsafe_allow_html=True)
                             
-                            if static_only_mode or model is None:
+                            if static_only_mode:
                                 st.warning("Static-only mode: Cannot generate deep error corrections.")
                             else:
-                                prompt_text = get_instruction_for_mode("Fix Errors", len(code_input), is_fast_mode, {"message": error_msg, "line": error_line})
-                                prompt_text += f"\n\nCode causing error:\n```python\n{err_snippet}\n```"
-                                
-                                status_placeholder = st.info("Asking AI for a fast runtime fix...")
-                                placeholder = st.empty()
-                                
-                                response_chunks = []
-                                try:
-                                    for chunk in generate_response_stream(model, tokenizer, device, prompt_text, MAX_TOKENS, TEMPERATURE):
-                                        status_placeholder.empty()
-                                        response_chunks.append(chunk)
-                                        placeholder.markdown(f"<div class='fix-box'><b>Suggested Fix:</b><br><br>{''.join(response_chunks)}▌</div>", unsafe_allow_html=True)
+                                ai_model, ai_tokenizer, ai_device = get_ai_backend()
+                                if ai_model is None:
+                                    st.warning("AI model could not be loaded. Please check resource availability.")
+                                else:
+                                    prompt_text = get_instruction_for_mode("Fix Errors", len(code_input), is_fast_mode, {"message": error_msg, "line": error_line})
+                                    prompt_text += f"\n\nCode causing error:\n```python\n{err_snippet}\n```"
                                     
-                                    full_explanation = "".join(response_chunks)
-                                    placeholder.markdown(f"<div class='fix-box'><b>Suggested Fix:</b><br><br>{full_explanation}</div>", unsafe_allow_html=True)
-                                    elapsed = time.time() - start_time
+                                    status_placeholder = st.info("Asking AI for a fast runtime fix...")
+                                    placeholder = st.empty()
                                     
-                                    result_obj = {
-                                        "type": "fix_errors_failed",
-                                        "error_msg": error_msg,
-                                        "error_line": error_line,
-                                        "explanation": full_explanation,
-                                        "elapsed": elapsed
-                                    }
-                                    st.session_state.response_cache[cache_key] = result_obj
-                                    st.session_state.last_result = result_obj
-                                    st.caption(f"⏱️ Fix generated in {elapsed:.3f} seconds.")
-                                except Exception as e:
-                                    st.error(f"LLM Error: {str(e)}")
+                                    response_chunks = []
+                                    try:
+                                        for chunk in generate_response_stream(ai_model, ai_tokenizer, ai_device, prompt_text, MAX_TOKENS, TEMPERATURE):
+                                            status_placeholder.empty()
+                                            response_chunks.append(chunk)
+                                            placeholder.markdown(f"<div class='fix-box'><b>Suggested Fix:</b><br><br>{''.join(response_chunks)}▌</div>", unsafe_allow_html=True)
+                                        
+                                        full_explanation = "".join(response_chunks)
+                                        placeholder.markdown(f"<div class='fix-box'><b>Suggested Fix:</b><br><br>{full_explanation}</div>", unsafe_allow_html=True)
+                                        elapsed = time.time() - start_time
+                                        
+                                        result_obj = {
+                                            "type": "fix_errors_failed",
+                                            "error_msg": error_msg,
+                                            "error_line": error_line,
+                                            "explanation": full_explanation,
+                                            "elapsed": elapsed
+                                        }
+                                        set_response_cache(cache_key, result_obj)
+                                        st.session_state.last_result = result_obj
+                                        st.caption(f"⏱️ Fix generated in {elapsed:.3f} seconds.")
+                                    except Exception as e:
+                                        st.error(f"LLM Error: {str(e)}")
             
             # DEEP LOGIC SCAN
             elif action == "Run Logical Fix Scan":
                 st.subheader("Result: AI Logical Verification")
-                start_time = time.time()
-                prompt_text = "Verify if the following Python code contains any logical bugs. Keep the analysis short. If the logic looks correct, state so briefly. Code:\n"
-                prompt_text += f"```python\n{code_input[:3000]}\n```"
-                
-                status_placeholder = st.info("Scanning logic...")
-                placeholder = st.empty()
-                
-                response_chunks = []
-                try:
-                    for chunk in generate_response_stream(model, tokenizer, device, prompt_text, MAX_TOKENS, TEMPERATURE):
-                        status_placeholder.empty()
-                        response_chunks.append(chunk)
-                        placeholder.markdown("".join(response_chunks) + "▌")
+                ai_model, ai_tokenizer, ai_device = get_ai_backend()
+                if static_only_mode or ai_model is None:
+                    st.error("AI model could not be loaded for deep logic scan.")
+                else:
+                    start_time = time.time()
+                    prompt_text = "Verify if the following Python code contains any logical bugs. Keep the analysis short. If the logic looks correct, state so briefly. Code:\n"
+                    prompt_text += f"```python\n{code_input[:3000]}\n```"
                     
-                    full_response = "".join(response_chunks)
-                    placeholder.markdown(full_response)
-                    elapsed = time.time() - start_time
+                    status_placeholder = st.info("Scanning logic...")
+                    placeholder = st.empty()
                     
-                    result_obj = {
-                        "type": "markdown",
-                        "content": full_response,
-                        "elapsed": elapsed
-                    }
-                    st.session_state.last_result = result_obj
-                    st.caption(f"⏱️ Logic scan completed in {elapsed:.3f} seconds.")
-                except Exception as e:
-                    st.error(f"LLM Error: {str(e)}")
+                    response_chunks = []
+                    try:
+                        for chunk in generate_response_stream(ai_model, ai_tokenizer, ai_device, prompt_text, MAX_TOKENS, TEMPERATURE):
+                            status_placeholder.empty()
+                            response_chunks.append(chunk)
+                            placeholder.markdown("".join(response_chunks) + "▌")
+                        
+                        full_response = "".join(response_chunks)
+                        placeholder.markdown(full_response)
+                        elapsed = time.time() - start_time
+                        
+                        result_obj = {
+                            "type": "markdown",
+                            "content": full_response,
+                            "elapsed": elapsed
+                        }
+                        st.session_state.last_result = result_obj
+                        st.caption(f"⏱️ Logic scan completed in {elapsed:.3f} seconds.")
+                    except Exception as e:
+                        st.error(f"LLM Error: {str(e)}")
 
             # ANALYZE COMPLEXITY (Static-first with LLM fallback)
             elif action == "Analyze Complexity":
@@ -984,12 +1029,13 @@ with col_results:
                             "explanation": explanation,
                             "elapsed": elapsed
                         }
-                        st.session_state.response_cache[cache_key] = result_obj
+                        set_response_cache(cache_key, result_obj)
                         st.session_state.last_result = result_obj
                         render_result(action, result_obj)
                     else:
                         # Fallback to local LLM
-                        if static_only_mode or model is None:
+                        ai_model, ai_tokenizer, ai_device = get_ai_backend()
+                        if static_only_mode or ai_model is None:
                             result_obj = {"type": "error", "message": "Static complexity check failed, and local AI model is not loaded."}
                             st.session_state.last_result = result_obj
                             render_result(action, result_obj)
@@ -1003,7 +1049,7 @@ with col_results:
                             
                             response_chunks = []
                             try:
-                                for chunk in generate_response_stream(model, tokenizer, device, prompt_text, MAX_TOKENS, TEMPERATURE):
+                                for chunk in generate_response_stream(ai_model, ai_tokenizer, ai_device, prompt_text, MAX_TOKENS, TEMPERATURE):
                                     status_placeholder.empty()
                                     response_chunks.append(chunk)
                                     placeholder.markdown("".join(response_chunks) + "▌")
@@ -1017,7 +1063,7 @@ with col_results:
                                     "content": full_response,
                                     "elapsed": elapsed
                                 }
-                                st.session_state.response_cache[cache_key] = result_obj
+                                set_response_cache(cache_key, result_obj)
                                 st.session_state.last_result = result_obj
                                 st.caption(f"⏱️ Complexity analysis completed in {elapsed:.3f} seconds.")
                             except Exception as e:
@@ -1032,7 +1078,8 @@ with col_results:
                     st.session_state.last_result = result_obj
                     render_result(action, result_obj)
                 else:
-                    if static_only_mode or model is None:
+                    ai_model, ai_tokenizer, ai_device = get_ai_backend()
+                    if static_only_mode or ai_model is None:
                         result_obj = {"type": "error", "message": "AI model loading failed. Cannot optimize code."}
                         st.session_state.last_result = result_obj
                         render_result(action, result_obj)
@@ -1047,7 +1094,7 @@ with col_results:
                         
                         response_chunks = []
                         try:
-                            for chunk in generate_response_stream(model, tokenizer, device, prompt_text, MAX_TOKENS, TEMPERATURE):
+                            for chunk in generate_response_stream(ai_model, ai_tokenizer, ai_device, prompt_text, MAX_TOKENS, TEMPERATURE):
                                 status_placeholder.empty()
                                 response_chunks.append(chunk)
                                 placeholder.markdown("".join(response_chunks) + "▌")
@@ -1061,7 +1108,7 @@ with col_results:
                                 "content": full_response,
                                 "elapsed": elapsed
                             }
-                            st.session_state.response_cache[cache_key] = result_obj
+                            set_response_cache(cache_key, result_obj)
                             st.session_state.last_result = result_obj
                             st.caption(f"⏱️ Optimization completed in {elapsed:.3f} seconds.")
                         except Exception as e:
